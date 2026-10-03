@@ -5,6 +5,7 @@
  * kbd_thread_func in input.c) and delivers them to Wayland clients
  * via wlroots seat notifications. Logs all input events to a plaintext file.
  */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -61,48 +62,50 @@ void handle_key(struct server *s, uint32_t rune, int pressed) {
             return;
     }
     
-    uint32_t mod = keymapmod(rune);
-    if (mod) {
-        uint32_t current = focus_keyboard_get_modifiers(fm);
-        focus_keyboard_set_modifiers(fm, pressed ? (current | mod) : (current & ~mod));
-        return;
+    struct wlr_surface *focused = s->seat->keyboard_state.focused_surface;
+    if (!focused) {
+        struct toplevel *tl = focus_get_focused_toplevel(fm);
+        if (tl && tl->surface) {
+            focus_keyboard_set(fm, tl->surface, FOCUS_REASON_EXPLICIT);
+            focused = tl->surface;
+        }
     }
     
-    struct wlr_surface *focused = s->seat->keyboard_state.focused_surface;
     if (!focused) {
         wlr_log(WLR_DEBUG, "No keyboard focus for rune=0x%04x", rune);
         return;
     }
     
-    const struct key_map *km = keymap_lookup(rune);
-    if (!km) {
-        if (rune >= 0x80)
-            wlr_log(WLR_ERROR, "No keymap entry for rune=0x%04x", rune);
-        return;
-    }
-    
-    wlr_log(WLR_DEBUG, "Key: rune=0x%04x -> keycode=%d shift=%d", 
-            rune, km->keycode, km->shift);
-    
     wlr_seat_set_keyboard(s->seat, &s->virtual_kb);
     
-    uint32_t key_mods = 0;
-    if (km->shift) key_mods |= WLR_MODIFIER_SHIFT;
-    if (km->ctrl) key_mods |= WLR_MODIFIER_CTRL;
+    uint32_t evdev_keycode = 0;
+    if (rune >= 65 && rune <= 90) {
+        evdev_keycode = rune - 65 + 30; // A-Z
+    } else if (rune >= 97 && rune <= 122) {
+        evdev_keycode = rune - 97 + 30; // a-z
+    } else if (rune >= 48 && rune <= 57) {
+        evdev_keycode = rune == 48 ? 19 : (rune - 49 + 2); // 0-9
+    } else if (rune == 32) {
+        evdev_keycode = 57; // Space
+    } else if (rune == 13 || rune == 10) {
+        evdev_keycode = 28; // Enter
+    } else if (rune == 8 || rune == 127) {
+        evdev_keycode = 14; // Backspace
+    } else if (rune == 9) {
+        evdev_keycode = 15; // Tab
+    } else {
+        const struct key_map *km = keymap_lookup(rune);
+        evdev_keycode = km ? km->keycode : (rune & 0x7F);
+    }
     
-    if (key_mods && pressed) {
-        uint32_t current = focus_keyboard_get_modifiers(fm);
-        focus_keyboard_set_modifiers(fm, current | key_mods);
+    if (evdev_keycode == 0) {
+        wlr_log(WLR_DEBUG, "No keycode mapping for rune=0x%04x", rune);
+        return;
     }
     
     uint32_t state = pressed ? WL_KEYBOARD_KEY_STATE_PRESSED 
                              : WL_KEYBOARD_KEY_STATE_RELEASED;
-    wlr_seat_keyboard_notify_key(s->seat, t, km->keycode, state);
-    
-    if (key_mods && !pressed) {
-        uint32_t current = focus_keyboard_get_modifiers(fm);
-        focus_keyboard_set_modifiers(fm, current & ~key_mods);
-    }
+    wlr_seat_keyboard_notify_key(s->seat, t, evdev_keycode, state);
 }
 
 /* ============== Mouse Handling ============== */
@@ -187,6 +190,11 @@ void handle_mouse(struct server *s, int mx, int my, int buttons) {
     
     if ((changed & 1) && (buttons & 1) && surface) {
         surface = focus_handle_click(fm, surface, sx, sy, BTN_LEFT);
+        struct toplevel *tl = focus_toplevel_from_surface(fm, surface);
+        if (tl) {
+            focus_toplevel(fm, tl, FOCUS_REASON_POINTER_CLICK);
+            focus_keyboard_set(fm, tl->surface, FOCUS_REASON_POINTER_CLICK);
+        }
         if (surface) {
             struct wlr_surface *new_surface = focus_surface_at_cursor(fm, &sx, &sy);
             if (new_surface != surface)
